@@ -655,21 +655,21 @@ public:
 
       @tparam Op The code to benchmark.
      */
-    template <typename Op>
+    template <typename Op, typename Setup = void(*)(), typename Teardown = void(*)()>
     ANKERL_NANOBENCH(NOINLINE)
-    Bench& run(char const* benchmarkName, Op&& op);
+    Bench& run(char const* benchmarkName, Op&& op, Setup&& setup = []{}, Teardown&& teardown = []{});
 
-    template <typename Op>
+    template <typename Op, typename Setup = void(*)(), typename Teardown = void(*)()>
     ANKERL_NANOBENCH(NOINLINE)
-    Bench& run(std::string const& benchmarkName, Op&& op);
+    Bench& run(std::string const& benchmarkName, Op&& op, Setup&& setup = []{}, Teardown&& teardown = []{});
 
     /**
      * @brief Same as run(char const* benchmarkName, Op op), but instead uses the previously set name.
      * @tparam Op The code to benchmark.
      */
-    template <typename Op>
+    template <typename Op, typename Setup = void(*)(), typename Teardown = void(*)()>
     ANKERL_NANOBENCH(NOINLINE)
-    Bench& run(Op&& op);
+    Bench& run(Op&& op, Setup&& setup = []{}, Teardown&& teardown = []{});
 
     /**
      * @brief Title of the benchmark, will be shown in the table header. Changing the title will start a new markdown table.
@@ -1207,14 +1207,15 @@ constexpr uint64_t Rng::rotl(uint64_t x, unsigned k) noexcept {
     return (x << k) | (x >> (64U - k));
 }
 
-template <typename Op>
+template <typename Op, typename Setup, typename Teardown>
 ANKERL_NANOBENCH_NO_SANITIZE("integer")
-Bench& Bench::run(Op&& op) {
+Bench& Bench::run(Op&& op, Setup&& setup, Teardown&& teardown) {
     // It is important that this method is kept short so the compiler can do better optimizations/ inlining of op()
     detail::IterationLogic iterationLogic(*this);
     auto& pc = detail::performanceCounters();
 
     while (auto n = iterationLogic.numIters()) {
+        setup();
         pc.beginMeasure();
         Clock::time_point const before = Clock::now();
         while (n-- > 0) {
@@ -1224,22 +1225,23 @@ Bench& Bench::run(Op&& op) {
         pc.endMeasure();
         pc.updateResults(iterationLogic.numIters());
         iterationLogic.add(after - before, pc);
+        teardown();
     }
     iterationLogic.moveResultTo(mResults);
     return *this;
 }
 
 // Performs all evaluations.
-template <typename Op>
-Bench& Bench::run(char const* benchmarkName, Op&& op) {
+template <typename Op, typename Setup, typename Teardown>
+Bench& Bench::run(char const* benchmarkName, Op&& op, Setup&& setup, Teardown&& teardown) {
     name(benchmarkName);
-    return run(std::forward<Op>(op));
+    return run(std::forward<Op>(op), std::forward<Setup>(setup), std::forward<Teardown>(teardown));
 }
 
-template <typename Op>
-Bench& Bench::run(std::string const& benchmarkName, Op&& op) {
+template <typename Op, typename Setup, typename Teardown>
+Bench& Bench::run(std::string const& benchmarkName, Op&& op, Setup&& setup, Teardown&& teardown) {
     name(benchmarkName);
-    return run(std::forward<Op>(op));
+    return run(std::forward<Op>(op), std::forward<Setup>(setup), std::forward<Teardown>(teardown));
 }
 
 template <typename Op>
