@@ -45,6 +45,7 @@
 #include <string>        // all names
 #include <unordered_map> // holds context information of results
 #include <vector>        // holds all results
+#include <cerrno>        // std::perror
 
 #define ANKERL_NANOBENCH(x) ANKERL_NANOBENCH_PRIVATE_##x()
 
@@ -655,21 +656,32 @@ public:
 
       @tparam Op The code to benchmark.
      */
-    template <typename Op, typename Setup = void(*)(), typename Teardown = void(*)()>
+    template <typename Setup, typename Op, typename Teardown = void (*)()>
     ANKERL_NANOBENCH(NOINLINE)
-    Bench& run(char const* benchmarkName, Op&& op, Setup&& setup = []{}, Teardown&& teardown = []{});
+    Bench& run(
+        char const* benchmarkName, Setup&& setup, Op&& op, Teardown&& teardown = [] {});
 
-    template <typename Op, typename Setup = void(*)(), typename Teardown = void(*)()>
+    template <typename Setup, typename Op, typename Teardown = void (*)()>
     ANKERL_NANOBENCH(NOINLINE)
-    Bench& run(std::string const& benchmarkName, Op&& op, Setup&& setup = []{}, Teardown&& teardown = []{});
+    Bench& run(
+        std::string const& benchmarkName, Setup&& setup, Op&& op, Teardown&& teardown = [] {});
 
     /**
      * @brief Same as run(char const* benchmarkName, Op op), but instead uses the previously set name.
      * @tparam Op The code to benchmark.
      */
-    template <typename Op, typename Setup = void(*)(), typename Teardown = void(*)()>
+    template <typename Setup, typename Op, typename Teardown = void (*)()>
     ANKERL_NANOBENCH(NOINLINE)
-    Bench& run(Op&& op, Setup&& setup = []{}, Teardown&& teardown = []{});
+    Bench& run(
+        Setup&& setup, Op&& op, Teardown&& teardown = [] {});
+
+    /**
+     * @brief Same as run(char const* benchmarkName, Op op), but instead uses the previously set name.
+     * @tparam Op The code to benchmark.
+     */
+    template <typename Op>
+    ANKERL_NANOBENCH(NOINLINE)
+    Bench& run(Op&& op);
 
     /**
      * @brief Title of the benchmark, will be shown in the table header. Changing the title will start a new markdown table.
@@ -1088,7 +1100,9 @@ public:
     ~PerformanceCounters();
 
     void beginMeasure();
-    void endMeasure();
+    void pauseMeasure();
+    void resetMeasure();
+    void continueMeasure();
     void updateResults(uint64_t numIters);
 
     ANKERL_NANOBENCH(NODISCARD) PerfCountSet<uint64_t> const& val() const noexcept;
@@ -1207,43 +1221,51 @@ constexpr uint64_t Rng::rotl(uint64_t x, unsigned k) noexcept {
     return (x << k) | (x >> (64U - k));
 }
 
-template <typename Op, typename Setup, typename Teardown>
+template <typename Op>
 ANKERL_NANOBENCH_NO_SANITIZE("integer")
-Bench& Bench::run(Op&& op, Setup&& setup, Teardown&& teardown) {
+Bench& Bench::run(Op&& op) {
+    return run([] {}, std::forward<Op>(op), [] {});
+}
+
+template <typename Setup, typename Op, typename Teardown>
+ANKERL_NANOBENCH_NO_SANITIZE("integer")
+Bench& Bench::run(Setup&& setup, Op&& op, Teardown&& teardown) {
     // It is important that this method is kept short so the compiler can do better optimizations/ inlining of op()
     detail::IterationLogic iterationLogic(*this);
     auto& pc = detail::performanceCounters();
 
     while (auto n = iterationLogic.numIters()) {
-        setup();
-        pc.beginMeasure();
-        Clock::time_point const before = Clock::now();
+        Clock::duration duration{0U};
+        pc.resetMeasure();
         while (n-- > 0) {
+            setup();
+            pc.continueMeasure();
+            Clock::time_point const before{Clock::now()};
             op();
+            Clock::time_point const after{Clock::now()};
+            pc.pauseMeasure();
+            duration += after - before;
+            teardown();
         }
-        Clock::time_point const after = Clock::now();
-        pc.endMeasure();
         pc.updateResults(iterationLogic.numIters());
-        iterationLogic.add(after - before, pc);
-        teardown();
+        iterationLogic.add(duration, pc);
     }
     iterationLogic.moveResultTo(mResults);
     return *this;
 }
 
 // Performs all evaluations.
-template <typename Op, typename Setup, typename Teardown>
-Bench& Bench::run(char const* benchmarkName, Op&& op, Setup&& setup, Teardown&& teardown) {
+template <typename Setup, typename Op, typename Teardown>
+Bench& Bench::run(char const* benchmarkName, Setup&& setup, Op&& op, Teardown&& teardown) {
     name(benchmarkName);
-    return run(std::forward<Op>(op), std::forward<Setup>(setup), std::forward<Teardown>(teardown));
+    return run(std::forward<Setup>(setup), std::forward<Op>(op), std::forward<Teardown>(teardown));
 }
 
-template <typename Op, typename Setup, typename Teardown>
-Bench& Bench::run(std::string const& benchmarkName, Op&& op, Setup&& setup, Teardown&& teardown) {
+template <typename Setup, typename Op, typename Teardown>
+Bench& Bench::run(std::string const& benchmarkName, Setup&& setup, Op&& op, Teardown&& teardown) {
     name(benchmarkName);
-    return run(std::forward<Op>(op), std::forward<Setup>(setup), std::forward<Teardown>(teardown));
+    return run(std::forward<Setup>(setup), std::forward<Op>(op), std::forward<Teardown>(teardown));
 }
-
 template <typename Op>
 BigO Bench::complexityBigO(char const* benchmarkName, Op op) const {
     return BigO(benchmarkName, BigO::collectRangeMeasure(mResults), op);
@@ -2448,8 +2470,7 @@ public:
         return mHasError;
     }
 
-    // Just reading data is faster than enable & disabling.
-    // we subtract data ourselves.
+
     inline void beginMeasure() {
         if (mHasError) {
             return;
@@ -2465,7 +2486,22 @@ public:
         mHasError = -1 == ioctl(mFd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
     }
 
-    inline void endMeasure() {
+    inline void resetMeasure() {
+        if (mHasError) {
+            return;
+        }
+
+        // NOLINTNEXTLINE(hicpp-signed-bitwise,cppcoreguidelines-pro-type-vararg)
+        mHasError = -1 == ioctl(mFd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
+        if (mHasError) {
+            return;
+        }
+
+        // NOLINTNEXTLINE(hicpp-signed-bitwise,cppcoreguidelines-pro-type-vararg)
+        mHasError = -1 == ioctl(mFd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+    }
+
+    inline void pauseMeasure() {
         if (mHasError) {
             return;
         }
@@ -2479,6 +2515,15 @@ public:
         auto const numBytes = sizeof(uint64_t) * mCounters.size();
         auto ret = read(mFd, mCounters.data(), numBytes);
         mHasError = ret != static_cast<ssize_t>(numBytes);
+    }
+
+    inline void continueMeasure() {
+        if (mHasError) {
+            return;
+        }
+
+        // NOLINTNEXTLINE(hicpp-signed-bitwise,cppcoreguidelines-pro-type-vararg)
+        mHasError = -1 == ioctl(mFd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
     }
 
     void updateResults(uint64_t numIters);
@@ -2513,7 +2558,7 @@ public:
         for (size_t iter = 0; iter < 100; ++iter) {
             beginMeasure();
             op();
-            endMeasure();
+            pauseMeasure();
             if (mHasError) {
                 return;
             }
@@ -2541,7 +2586,7 @@ public:
             while (n-- > 0) {
                 x = mix(x);
             }
-            endMeasure();
+            pauseMeasure();
             detail::doNotOptimizeAway(x);
             auto measure1 = mCounters;
 
@@ -2552,7 +2597,7 @@ public:
                 x = mix(x);
                 x = mix(x);
             }
-            endMeasure();
+            pauseMeasure();
             detail::doNotOptimizeAway(x);
             auto measure2 = mCounters;
 
@@ -2670,6 +2715,15 @@ bool LinuxPerformanceCounters::monitor(uint32_t type, uint64_t eventid, Target t
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
     auto fd = static_cast<int>(syscall(__NR_perf_event_open, &pea, pid, cpu, mFd, flags));
     if (-1 == fd) {
+#        if defined(ANKERL_NANOBENCH_LOG_ENABLED)
+        if (pea.type == 0) {
+            perror("syscall error occurred for HW event. Most likely performance counters are not enabled on your system / "
+                   "virtual machine");
+        } else {
+            perror("syscall error occurred for a SW event");
+        }
+#        endif
+
         return false;
     }
     if (-1 == mFd) {
@@ -2740,8 +2794,16 @@ void PerformanceCounters::beginMeasure() {
     mPc->beginMeasure();
 }
 
-void PerformanceCounters::endMeasure() {
-    mPc->endMeasure();
+void PerformanceCounters::pauseMeasure() {
+    mPc->pauseMeasure();
+}
+
+void PerformanceCounters::continueMeasure() {
+    mPc->continueMeasure();
+}
+
+void PerformanceCounters::resetMeasure() {
+    mPc->resetMeasure();
 }
 
 void PerformanceCounters::updateResults(uint64_t numIters) {
@@ -2753,7 +2815,9 @@ void PerformanceCounters::updateResults(uint64_t numIters) {
 PerformanceCounters::PerformanceCounters() = default;
 PerformanceCounters::~PerformanceCounters() = default;
 void PerformanceCounters::beginMeasure() {}
-void PerformanceCounters::endMeasure() {}
+void PerformanceCounters::pauseMeasure() {}
+void PerformanceCounters::resetMeasure() {}
+void PerformanceCounters::continueMeasure() {}
 void PerformanceCounters::updateResults(uint64_t) {}
 
 #    endif
